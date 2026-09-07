@@ -146,10 +146,24 @@ async def _await_subprocess_creation(create_coro):
     """Make process creation cancellation-safe so a spawned child is never lost."""
     create_task = asyncio.create_task(create_coro)
     try:
-        return await asyncio.shield(create_task)
+        proc = await asyncio.shield(create_task)
+        if not IS_WINDOWS:
+            # Record the isolated group before returning to the caller. This is
+            # also required on the cancellation path when the group leader has
+            # already exited but one of its children is still alive.
+            try:
+                proc._odysseus_pgid = proc.pid
+            except AttributeError:
+                pass
+        return proc
     except asyncio.CancelledError:
         try:
             proc = await asyncio.shield(create_task)
+            if not IS_WINDOWS:
+                try:
+                    proc._odysseus_pgid = proc.pid
+                except AttributeError:
+                    pass
             _kill_proc_tree(proc)
             await asyncio.shield(proc.wait())
         except Exception:

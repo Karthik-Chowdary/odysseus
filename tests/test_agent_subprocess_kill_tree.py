@@ -3,6 +3,7 @@ import asyncio
 import os
 import shlex
 import shutil
+import signal
 import sys
 import tempfile
 
@@ -354,6 +355,63 @@ def test_cancel_preserves_preexisting_tmux_background_job(tmp_path):
             for marker in (survivor, cancelled):
                 if os.path.exists(marker):
                     os.unlink(marker)
+
+    asyncio.run(_run())
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX process-group behavior")
+def test_creation_cancel_remembers_group_after_leader_exits(monkeypatch, tmp_path):
+    async def _run():
+        marker = str(tmp_path / "creation-cancel.alive")
+        started = asyncio.Event()
+        release = asyncio.Event()
+        original_create = asyncio.create_subprocess_shell
+        pgid = None
+
+        async def delayed_create(command, **kwargs):
+            nonlocal pgid
+            proc = await original_create(command, **kwargs)
+            pgid = proc.pid
+            await proc.wait()
+            started.set()
+            await release.wait()
+            return proc
+
+        monkeypatch.setattr(asyncio, "create_subprocess_shell", delayed_create)
+        script = (
+            f"(while :; do touch {shlex.quote(marker)}; sleep .1; done) "
+            ">/dev/null 2>&1 &"
+        )
+        task = asyncio.create_task(_create_bash_subprocess(
+            script, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        ))
+        try:
+            await asyncio.wait_for(started.wait(), timeout=3)
+            for _ in range(30):
+                if os.path.exists(marker):
+                    break
+                await asyncio.sleep(0.05)
+            assert os.path.exists(marker), "background child never started"
+            task.cancel()
+            release.set()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            os.unlink(marker)
+            await asyncio.sleep(0.7)
+            assert not os.path.exists(marker), (
+                "creation cancellation lost the group after its leader exited"
+            )
+        finally:
+            release.set()
+            if not task.done():
+                task.cancel()
+            if pgid is not None:
+                try:
+                    os.killpg(pgid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            if os.path.exists(marker):
+                os.unlink(marker)
 
     asyncio.run(_run())
 
