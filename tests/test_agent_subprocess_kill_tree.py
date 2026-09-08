@@ -254,6 +254,36 @@ def test_tmux_send_line_submits_text_and_enter_atomically(monkeypatch):
 
 
 
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="procfs behavior")
+def test_posix_parent_map_closes_proc_stat_files(monkeypatch):
+    import io
+
+    from src.agent_tools.subprocess_tools import _posix_parent_map
+
+    opened = []
+
+    class Entry:
+        name = "123"
+
+    class TrackedStat(io.StringIO):
+        def close(self):
+            opened.append("closed")
+            super().close()
+
+    monkeypatch.setattr("src.agent_tools.subprocess_tools.os.scandir", lambda path: [Entry()])
+    handles = []
+
+    def tracked_open(*args, **kwargs):
+        handle = TrackedStat("123 (cmd) S 1 0 0 0")
+        handles.append(handle)
+        return handle
+
+    monkeypatch.setattr("builtins.open", tracked_open)
+
+    assert _posix_parent_map() == {1: [123]}
+    assert opened == ["closed"]
+
+
 def test_posix_descendant_walk_handles_cycles(monkeypatch):
     monkeypatch.setattr(
         "src.agent_tools.subprocess_tools._posix_parent_map",

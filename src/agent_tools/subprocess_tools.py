@@ -30,7 +30,8 @@ def _posix_parent_map() -> dict[int, list[int]]:
                 if not entry.name.isdigit():
                     continue
                 try:
-                    stat = open(f"/proc/{entry.name}/stat", encoding="utf-8").read()
+                    with open(f"/proc/{entry.name}/stat", encoding="utf-8") as stat_file:
+                        stat = stat_file.read()
                     fields = stat.rpartition(")")[2].split()
                     children_by_parent[int(fields[1])].append(int(entry.name))
                 except (OSError, ValueError, IndexError):
