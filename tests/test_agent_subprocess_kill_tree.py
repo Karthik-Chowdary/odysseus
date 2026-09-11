@@ -306,6 +306,43 @@ def test_windows_kill_dispatch(monkeypatch):
     assert called == [123]
 
 
+def test_cancel_while_draining_exited_process_still_requests_tree_cleanup(monkeypatch):
+    async def _run():
+        reader_started = asyncio.Event()
+        cleanup_calls = []
+
+        class Stream:
+            async def readline(self):
+                reader_started.set()
+                await asyncio.Event().wait()
+
+        class Proc:
+            pid = 123
+            returncode = 0
+            stdout = Stream()
+            stderr = Stream()
+
+        monkeypatch.setattr(
+            "src.agent_tools.subprocess_tools._kill_proc_tree", cleanup_calls.append
+        )
+        monkeypatch.setattr(
+            "src.agent_tools.subprocess_tools._kill_remembered_proc_group",
+            lambda proc: None,
+        )
+
+        task = asyncio.create_task(_run_subprocess_streaming(Proc(), timeout=30))
+        await reader_started.wait()
+        await asyncio.sleep(0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert len(cleanup_calls) == 1
+        assert cleanup_calls[0].pid == 123
+
+    asyncio.run(_run())
+
+
 @pytest.mark.skipif(sys.platform == "win32", reason="tmux is POSIX-only")
 @pytest.mark.skipif(shutil.which("tmux") is None, reason="tmux unavailable")
 def test_timeout_kills_tmux_backgrounded_command(tmp_path):

@@ -590,13 +590,17 @@ async def _run_subprocess_streaming(
         readers = asyncio.gather(rd_out, rd_err, return_exceptions=True)
         try:
             await asyncio.wait_for(asyncio.shield(readers), timeout=1)
-        except asyncio.TimeoutError:
+        except (asyncio.CancelledError, asyncio.TimeoutError) as exc:
             # The direct process exited, but a background child still owns an
             # inherited output pipe. Clean up its remembered process group.
+            # Cancellation can arrive while draining these readers, after the
+            # main cancellation handler is no longer active.
             _kill_proc_tree(proc)
             for t in (rd_out, rd_err):
                 t.cancel()
             await readers
+            if isinstance(exc, asyncio.CancelledError):
+                raise
 
     return (
         "\n".join(stdout_full),
