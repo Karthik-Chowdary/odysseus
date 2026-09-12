@@ -107,6 +107,38 @@ def test_parent_exit_cleans_child_with_redirected_output():
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX process-group behavior")
 @pytest.mark.skipif(shutil.which("setsid") is None, reason="setsid unavailable")
+def test_parent_exit_cleans_detached_child_with_redirected_output():
+    async def _run():
+        marker = _marker_path()
+        inner = f"while :; do touch {shlex.quote(marker)}; sleep .1; done"
+        script = (
+            f"setsid sh -c {shlex.quote(inner)} >/dev/null 2>&1 & "
+            "sleep .2"
+        )
+        proc = await _create_bash_subprocess(
+            script, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            for _ in range(30):
+                if os.path.exists(marker):
+                    break
+                await asyncio.sleep(0.05)
+            assert os.path.exists(marker), "detached child never started"
+            _, _, rc, timed_out = await _run_subprocess_streaming(proc, timeout=30)
+            assert (rc, timed_out) == (0, False)
+            os.unlink(marker)
+            await asyncio.sleep(0.7)
+            assert not os.path.exists(marker)
+        finally:
+            _kill_proc_tree(proc)
+            if os.path.exists(marker):
+                os.unlink(marker)
+
+    asyncio.run(_run())
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX process-group behavior")
+@pytest.mark.skipif(shutil.which("setsid") is None, reason="setsid unavailable")
 def test_cancel_kills_descendant_that_detaches_session():
     marker = _marker_path()
     inner = f"while :; do touch {shlex.quote(marker)}; sleep .1; done"
@@ -285,10 +317,16 @@ def test_posix_parent_map_closes_proc_stat_files(monkeypatch):
 
 
 def test_posix_descendant_walk_handles_cycles(monkeypatch):
-    monkeypatch.setattr(
-        "src.agent_tools.subprocess_tools._posix_parent_map",
-        lambda: {10: [11], 11: [12], 12: [11]},
-    )
+    if sys.platform.startswith("linux"):
+        monkeypatch.setattr(
+            "src.agent_tools.subprocess_tools._linux_child_pids",
+            lambda pid: {10: [11], 11: [12], 12: [11]}.get(pid, []),
+        )
+    else:
+        monkeypatch.setattr(
+            "src.agent_tools.subprocess_tools._posix_parent_map",
+            lambda: {10: [11], 11: [12], 12: [11]},
+        )
     assert _posix_descendant_pids(10) == [11, 12]
 
 
@@ -327,7 +365,7 @@ def test_cancel_while_draining_exited_process_still_requests_tree_cleanup(monkey
         )
         monkeypatch.setattr(
             "src.agent_tools.subprocess_tools._kill_remembered_proc_group",
-            lambda proc: None,
+            lambda proc, descendants=None: None,
         )
 
         task = asyncio.create_task(_run_subprocess_streaming(Proc(), timeout=30))

@@ -62,10 +62,40 @@ def _posix_parent_map() -> dict[int, list[int]]:
     return children_by_parent
 
 
+def _linux_child_pids(parent_pid: int) -> list[int]:
+    """Read direct children without scanning the system-wide process table."""
+    try:
+        value = open(
+            f"/proc/{parent_pid}/task/{parent_pid}/children", encoding="utf-8"
+        ).read()
+    except OSError:
+        return []
+    children = []
+    for item in value.split():
+        try:
+            children.append(int(item))
+        except ValueError:
+            pass
+    return children
+
+
 def _posix_descendant_pids(root_pid: int) -> list[int]:
     """Return a best-effort snapshot of descendants before their parent exits."""
+    if sys.platform.startswith("linux"):
+        descendants: list[int] = []
+        seen: set[int] = set()
+        pending = _linux_child_pids(root_pid)
+        while pending:
+            pid = pending.pop()
+            if pid in seen:
+                continue
+            seen.add(pid)
+            descendants.append(pid)
+            pending.extend(_linux_child_pids(pid))
+        return descendants
+
     children_by_parent = _posix_parent_map()
-    descendants: list[int] = []
+    descendants = []
     seen: set[int] = set()
     pending = list(children_by_parent.get(root_pid, ()))
     while pending:
@@ -76,6 +106,31 @@ def _posix_descendant_pids(root_pid: int) -> list[int]:
         descendants.append(pid)
         pending.extend(children_by_parent.get(pid, ()))
     return descendants
+
+
+def _posix_process_identity(pid: int) -> tuple[int, int] | None:
+    """Return (process group, start identity) for safe delayed signalling."""
+    if sys.platform.startswith("linux"):
+        try:
+            with open(f"/proc/{pid}/stat", encoding="utf-8") as stat_file:
+                fields = stat_file.read().rpartition(")")[2].split()
+            # After removing pid/comm, pgrp is field 5 and starttime is field 22.
+            return int(fields[2]), int(fields[19])
+        except (OSError, ValueError, IndexError):
+            return None
+    # Portable fallback cannot safely retain a PID beyond the current snapshot.
+    return None
+
+
+def _pid_is_confirmed_absent(pid: int) -> bool:
+    """Return true only when the OS confirms no process owns this PID."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
+    except (PermissionError, OSError):
+        return False
+    return False
 
 
 def _kill_proc_tree(proc: asyncio.subprocess.Process) -> None:
@@ -130,17 +185,43 @@ def _kill_proc_tree(proc: asyncio.subprocess.Process) -> None:
             pass
 
 
-def _kill_remembered_proc_group(proc: asyncio.subprocess.Process) -> None:
-    """Kill the isolated POSIX group after its leader has already exited."""
+def _kill_remembered_proc_group(
+    proc: asyncio.subprocess.Process,
+    descendants: dict[int, tuple[int, int]] | None = None,
+) -> None:
+    """Kill retained POSIX groups/PIDs after the process leader has exited."""
     if IS_WINDOWS:
         return
-    group = getattr(proc, "_odysseus_pgid", None)
-    if group is None or group == os.getpgrp():
-        return
-    try:
-        os.killpg(group, signal.SIGKILL)
-    except (OSError, ProcessLookupError):
-        pass
+    own_group = os.getpgrp()
+    root_group = getattr(proc, "_odysseus_pgid", None)
+    verified: list[tuple[int, int]] = []
+    for pid, identity in (descendants or {}).items():
+        if _posix_process_identity(pid) == identity:
+            verified.append((pid, identity[0]))
+    groups = {group for _, group in verified if group != own_group}
+    # A reused PGID requires a live process whose PID equals that PGID. The
+    # original leader identity, or absence of such a PID, proves this is still
+    # the retained command group; a mismatched identity means it was reused.
+    root_identity = getattr(proc, "_odysseus_identity", None)
+    live_root_identity = (
+        _posix_process_identity(root_group) if root_group is not None else None
+    )
+    root_group_safe = root_group is not None and (
+        (root_identity is not None and live_root_identity == root_identity)
+        or (live_root_identity is None and _pid_is_confirmed_absent(root_group))
+    )
+    if root_group_safe or any(group == root_group for _, group in verified):
+        groups.add(root_group)
+    for group in groups:
+        try:
+            os.killpg(group, signal.SIGKILL)
+        except (OSError, ProcessLookupError):
+            pass
+    for pid, _ in reversed(verified):
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except (OSError, ProcessLookupError):
+            pass
 
 
 async def _await_subprocess_creation(create_coro):
@@ -154,6 +235,7 @@ async def _await_subprocess_creation(create_coro):
             # already exited but one of its children is still alive.
             try:
                 proc._odysseus_pgid = proc.pid
+                proc._odysseus_identity = _posix_process_identity(proc.pid)
             except AttributeError:
                 pass
         return proc
@@ -163,6 +245,7 @@ async def _await_subprocess_creation(create_coro):
             if not IS_WINDOWS:
                 try:
                     proc._odysseus_pgid = proc.pid
+                    proc._odysseus_identity = _posix_process_identity(proc.pid)
                 except AttributeError:
                     pass
             _kill_proc_tree(proc)
@@ -554,14 +637,20 @@ async def _run_subprocess_streaming(
         # after the direct child exits. Poll returncode so an orphaned
         # background child cannot consume the entire command timeout.
         deadline = time.monotonic() + timeout
+        observed_descendants: dict[int, tuple[int, int]] = {}
         while proc.returncode is None:
+            if not IS_WINDOWS:
+                for pid in _posix_descendant_pids(proc.pid):
+                    identity = _posix_process_identity(pid)
+                    if identity is not None:
+                        observed_descendants[pid] = identity
             if time.monotonic() >= deadline:
                 raise asyncio.TimeoutError
             await asyncio.sleep(min(0.05, max(0, deadline - time.monotonic())))
-        # A successful shell may leave ordinary children behind even when they
-        # redirect inherited output. Kill its remembered isolated group promptly
-        # without scanning by an exited PID, and preserve the shell return code.
-        _kill_remembered_proc_group(proc)
+        # A successful shell may leave descendants behind even when they detach
+        # into a new session and redirect inherited output. Retain snapshots while
+        # the parent is alive so cleanup does not depend on an exited root PID.
+        _kill_remembered_proc_group(proc, observed_descendants)
     except asyncio.TimeoutError:
         timed_out = True
         _kill_proc_tree(proc)
@@ -689,6 +778,7 @@ class PythonTool:
         if not IS_WINDOWS:
             try:
                 proc._odysseus_pgid = proc.pid
+                proc._odysseus_identity = _posix_process_identity(proc.pid)
             except AttributeError:
                 pass
         stdout, stderr, rc, timed_out = await _run_subprocess_streaming(
