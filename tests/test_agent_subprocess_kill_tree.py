@@ -264,6 +264,56 @@ def test_tmux_session_names_do_not_collide_after_tmux_canonicalizing_periods():
     asyncio.run(_run())
 
 
+def test_run_exec_timeout_reaps_helper_process(monkeypatch):
+    class FakeProcess:
+        returncode = None
+
+        def __init__(self):
+            self.killed = False
+            self.communicated_after_kill = False
+
+        async def communicate(self):
+            if not self.killed:
+                await asyncio.Future()
+            self.communicated_after_kill = True
+            self.returncode = -signal.SIGKILL
+            return b"", b""
+
+        def kill(self):
+            self.killed = True
+
+    async def _run():
+        proc = FakeProcess()
+
+        async def create_subprocess_exec(*args, **kwargs):
+            return proc
+
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", create_subprocess_exec)
+        result = await _run_exec("tmux", "has-session", timeout=0.001)
+        assert result == ("", "timeout", 124)
+        assert proc.killed is True
+        assert proc.communicated_after_kill is True
+
+    asyncio.run(_run())
+
+
+def test_run_exec_timeout_drains_full_output_pipe():
+    async def _run():
+        result = await asyncio.wait_for(
+            _run_exec(
+                sys.executable,
+                "-c",
+                "import sys, time; sys.stdout.write('x' * 10_000_000); "
+                "sys.stdout.flush(); time.sleep(10)",
+                timeout=0.01,
+            ),
+            timeout=3,
+        )
+        assert result == ("", "timeout", 124)
+
+    asyncio.run(_run())
+
+
 def test_tmux_send_line_submits_text_and_enter_atomically(monkeypatch):
     async def _run():
         calls = []

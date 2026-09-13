@@ -336,6 +336,12 @@ async def _run_exec(*args: str, timeout: float = 10) -> Tuple[str, str, int]:
         try:
             proc.kill()
         except Exception:
+            return "", "timeout", 124
+        try:
+            # Draining is required as well as waiting: a killed helper can remain
+            # blocked in asyncio's subprocess transport when its pipes are full.
+            await asyncio.wait_for(proc.communicate(), timeout=2)
+        except Exception:
             pass
         return "", "timeout", 124
     return (
