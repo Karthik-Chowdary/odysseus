@@ -65,9 +65,10 @@ def _posix_parent_map() -> dict[int, list[int]]:
 def _linux_child_pids(parent_pid: int) -> list[int]:
     """Read direct children without scanning the system-wide process table."""
     try:
-        value = open(
+        with open(
             f"/proc/{parent_pid}/task/{parent_pid}/children", encoding="utf-8"
-        ).read()
+        ) as children_file:
+            value = children_file.read()
     except OSError:
         return []
     children = []
