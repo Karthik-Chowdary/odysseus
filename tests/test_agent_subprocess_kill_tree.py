@@ -316,6 +316,28 @@ def test_posix_parent_map_closes_proc_stat_files(monkeypatch):
     assert opened == ["closed"]
 
 
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="procfs behavior")
+def test_linux_child_pids_closes_proc_children_file(monkeypatch):
+    import io
+
+    from src.agent_tools.subprocess_tools import _linux_child_pids
+
+    handles = []
+
+    class TrackedChildren(io.StringIO):
+        pass
+
+    def tracked_open(*args, **kwargs):
+        handle = TrackedChildren("11 12")
+        handles.append(handle)
+        return handle
+
+    monkeypatch.setattr("builtins.open", tracked_open)
+
+    assert _linux_child_pids(10) == [11, 12]
+    assert handles[0].closed
+
+
 def test_posix_descendant_walk_handles_cycles(monkeypatch):
     if sys.platform.startswith("linux"):
         monkeypatch.setattr(
