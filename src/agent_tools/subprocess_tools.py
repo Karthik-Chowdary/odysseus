@@ -146,6 +146,14 @@ def _kill_proc_tree(proc: asyncio.subprocess.Process) -> None:
     descendants = _posix_descendant_pids(pid)
     own_group = os.getpgrp()
     root_group = getattr(proc, "_odysseus_pgid", None)
+    root_identity = getattr(proc, "_odysseus_identity", None)
+    # A Process object can outlive its numeric PID/PGID. Never signal a group
+    # after Linux confirms that its leader PID has been reused by another
+    # process; proc.kill() would be unsafe for the same reason.
+    if root_identity is not None:
+        live_root_identity = _posix_process_identity(root_group or pid)
+        if live_root_identity is not None and live_root_identity != root_identity:
+            return
     if root_group is None:
         try:
             root_group = os.getpgid(pid)
@@ -377,7 +385,8 @@ async def _tmux_send_line(name: str, line: str) -> None:
 
 
 async def _interrupt_tmux_command(
-    name: str, protected_descendants: Optional[set[int]] = None
+    name: str,
+    protected_descendants: Optional[dict[int, tuple[int, int] | None]] = None,
 ) -> None:
     """Interrupt the active command without killing older persistent session jobs."""
     pane_pid = None
@@ -391,11 +400,18 @@ async def _interrupt_tmux_command(
             pass
 
     descendants = _posix_descendant_pids(pane_pid) if pane_pid else []
-    protected = set(protected_descendants or ())
+    protected_identities = dict(protected_descendants or {})
+    protected = {
+        pid for pid, identity in protected_identities.items()
+        if (identity is not None and _posix_process_identity(pid) == identity)
+        or (identity is None and not _pid_is_confirmed_absent(pid))
+    }
     # A persistent background job may fork after the command starts. Protect its
-    # current subtree as well as the processes present in the initial snapshot.
+    # current subtree as well as the identity-verified initial snapshot.
     for pid in tuple(protected):
-        protected.update(_posix_descendant_pids(pid))
+        for descendant in _posix_descendant_pids(pid):
+            if not _pid_is_confirmed_absent(descendant):
+                protected.add(descendant)
     descendants = [pid for pid in descendants if pid not in protected]
     await _run_exec("tmux", "send-keys", "-t", name, "C-c", timeout=3)
     if pane_pid is None:
@@ -499,7 +515,7 @@ async def _run_tmux_bash(
     lock = _TMUX_SESSION_LOCKS.setdefault(name, asyncio.Lock())
     async with lock:
         body = ""
-        protected_descendants: set[int] = set()
+        protected_descendants: dict[int, tuple[int, int] | None] = {}
         command_started = False
         # Conservative until the query completes: cancellation must never tear
         # down or interrupt a possibly pre-existing persistent session.
@@ -511,9 +527,8 @@ async def _run_tmux_bash(
             )
             if pane_rc == 0:
                 try:
-                    protected_descendants.update(
-                        _posix_descendant_pids(int(pane_out.strip()))
-                    )
+                    for pid in _posix_descendant_pids(int(pane_out.strip())):
+                        protected_descendants[pid] = _posix_process_identity(pid)
                 except ValueError:
                     pass
             await _ensure_tmux_session(name, cwd, env)

@@ -709,3 +709,95 @@ def test_cancel_before_first_tmux_line_does_not_interrupt(monkeypatch, tmp_path)
         assert not interrupted
 
     asyncio.run(_run())
+
+
+def test_kill_proc_tree_does_not_signal_reused_root_group(monkeypatch):
+    """A stale Process handle must not kill a group whose leader PID was reused."""
+    from types import SimpleNamespace
+    from src.agent_tools import subprocess_tools as tools
+
+    proc = SimpleNamespace(
+        pid=4100,
+        returncode=0,
+        _odysseus_pgid=4100,
+        _odysseus_identity=(4100, 11),
+        kill=lambda: (_ for _ in ()).throw(AssertionError("stale pid killed")),
+    )
+    monkeypatch.setattr(tools, "IS_WINDOWS", False)
+    monkeypatch.setattr(tools, "_posix_descendant_pids", lambda _pid: [])
+    monkeypatch.setattr(tools.os, "getpgrp", lambda: 999)
+    monkeypatch.setattr(
+        tools, "_posix_process_identity",
+        lambda pid: (4100, 22) if pid == 4100 else None,
+    )
+    signalled = []
+    monkeypatch.setattr(tools.os, "killpg", lambda pgid, sig: signalled.append(pgid))
+
+    tools._kill_proc_tree(proc)
+
+    assert signalled == []
+
+
+def test_interrupt_tmux_ignores_reused_protected_pid(monkeypatch):
+    """A reused PID must not protect a new command descendant from cleanup."""
+    from src.agent_tools import subprocess_tools as tools
+
+    async def run_exec(*args, **kwargs):
+        if args[:2] == ("tmux", "display-message"):
+            return "100\n", "", 0
+        return "", "", 0
+
+    async def send_line(*args, **kwargs):
+        return None
+
+    async def capture(*args, **kwargs):
+        return "__ODYSSEUS_INTERRUPT_READY_"
+
+    monkeypatch.setattr(tools, "_run_exec", run_exec)
+    monkeypatch.setattr(tools, "_tmux_send_line", send_line)
+    monkeypatch.setattr(tools, "_tmux_capture", capture)
+    monkeypatch.setattr(tools, "_posix_descendant_pids", lambda pid: [200] if pid == 100 else [])
+    monkeypatch.setattr(
+        tools, "_posix_process_identity",
+        lambda pid: (200, 99) if pid == 200 else (100, 1),
+    )
+    monkeypatch.setattr(tools.os, "getpgid", lambda pid: pid)
+    killed_pids = []
+    killed_groups = []
+    monkeypatch.setattr(tools.os, "kill", lambda pid, sig: killed_pids.append(pid))
+    monkeypatch.setattr(tools.os, "killpg", lambda pgid, sig: killed_groups.append(pgid))
+
+    asyncio.run(tools._interrupt_tmux_command("s", {200: (200, 12)}))
+
+    assert killed_pids == [200]
+    assert killed_groups == [200]
+
+
+def test_interrupt_tmux_preserves_portable_live_protected_pid(monkeypatch):
+    """POSIX platforms without start identities still preserve live old jobs."""
+    from src.agent_tools import subprocess_tools as tools
+
+    async def run_exec(*args, **kwargs):
+        if args[:2] == ("tmux", "display-message"):
+            return "100\n", "", 0
+        return "", "", 0
+    async def noop(*args, **kwargs):
+        return None
+
+    async def capture(*args, **kwargs):
+        return "__ODYSSEUS_INTERRUPT_READY_"
+
+    monkeypatch.setattr(tools, "_run_exec", run_exec)
+    monkeypatch.setattr(tools, "_tmux_send_line", noop)
+    monkeypatch.setattr(tools, "_tmux_capture", capture)
+    monkeypatch.setattr(tools, "_posix_descendant_pids", lambda pid: [200] if pid == 100 else [])
+    monkeypatch.setattr(tools, "_posix_process_identity", lambda pid: None)
+    monkeypatch.setattr(tools, "_pid_is_confirmed_absent", lambda pid: False)
+    monkeypatch.setattr(tools.os, "getpgid", lambda pid: pid)
+    killed = []
+    monkeypatch.setattr(tools.os, "kill", lambda pid, sig: killed.append(pid))
+    monkeypatch.setattr(tools.os, "killpg", lambda pgid, sig: killed.append(pgid))
+
+    asyncio.run(tools._interrupt_tmux_command("s", {200: None}))
+
+    assert killed == []
