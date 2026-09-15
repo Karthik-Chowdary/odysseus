@@ -773,6 +773,86 @@ def test_interrupt_tmux_ignores_reused_protected_pid(monkeypatch):
     assert killed_groups == [200]
 
 
+def test_interrupt_tmux_cleans_descendant_spawned_by_sigint_trap(monkeypatch):
+    """Rescan after C-c so an INT trap cannot fork a cleanup escapee."""
+    from src.agent_tools import subprocess_tools as tools
+
+    interrupted = False
+
+    async def run_exec(*args, **kwargs):
+        nonlocal interrupted
+        if args[:2] == ("tmux", "display-message"):
+            return "100\n", "", 0
+        if "C-c" in args:
+            interrupted = True
+        return "", "", 0
+
+    async def noop(*args, **kwargs):
+        return None
+
+    async def capture(*args, **kwargs):
+        return "__ODYSSEUS_INTERRUPT_READY_"
+
+    monkeypatch.setattr(tools, "_run_exec", run_exec)
+    monkeypatch.setattr(tools, "_tmux_send_line", noop)
+    monkeypatch.setattr(tools, "_tmux_capture", capture)
+    monkeypatch.setattr(
+        tools, "_posix_descendant_pids",
+        lambda pid: ([200, 201] if interrupted else [200]) if pid == 100 else [],
+    )
+    monkeypatch.setattr(tools, "_posix_process_identity", lambda pid: (pid, pid + 1))
+    monkeypatch.setattr(tools.os, "getpgid", lambda pid: pid)
+    killed_pids = []
+    killed_groups = []
+    monkeypatch.setattr(tools.os, "kill", lambda pid, sig: killed_pids.append(pid))
+    monkeypatch.setattr(tools.os, "killpg", lambda pgid, sig: killed_groups.append(pgid))
+
+    asyncio.run(tools._interrupt_tmux_command("s"))
+
+    assert 201 in killed_pids
+    assert 201 in killed_groups
+
+
+def test_interrupt_tmux_preserves_child_forked_by_protected_job(monkeypatch):
+    """A prior persistent job's child must remain protected after C-c."""
+    from src.agent_tools import subprocess_tools as tools
+
+    interrupted = False
+
+    async def run_exec(*args, **kwargs):
+        nonlocal interrupted
+        if args[:2] == ("tmux", "display-message"):
+            return "100\n", "", 0
+        if "C-c" in args:
+            interrupted = True
+        return "", "", 0
+
+    async def noop(*args, **kwargs): return None
+    async def capture(*args, **kwargs): return "__ODYSSEUS_INTERRUPT_READY_"
+
+    def descendants(pid):
+        if pid == 100:
+            return [200, 201] if interrupted else [200]
+        if pid == 200 and interrupted:
+            return [201]
+        return []
+
+    monkeypatch.setattr(tools, "_run_exec", run_exec)
+    monkeypatch.setattr(tools, "_tmux_send_line", noop)
+    monkeypatch.setattr(tools, "_tmux_capture", capture)
+    monkeypatch.setattr(tools, "_posix_descendant_pids", descendants)
+    monkeypatch.setattr(tools, "_posix_process_identity", lambda pid: (pid, pid + 1))
+    monkeypatch.setattr(tools, "_pid_is_confirmed_absent", lambda pid: False)
+    monkeypatch.setattr(tools.os, "getpgid", lambda pid: pid)
+    killed = []
+    monkeypatch.setattr(tools.os, "kill", lambda pid, sig: killed.append(pid))
+    monkeypatch.setattr(tools.os, "killpg", lambda pgid, sig: killed.append(pgid))
+
+    asyncio.run(tools._interrupt_tmux_command("s", {200: (200, 201)}))
+
+    assert killed == []
+
+
 def test_interrupt_tmux_preserves_portable_live_protected_pid(monkeypatch):
     """POSIX platforms without start identities still preserve live old jobs."""
     from src.agent_tools import subprocess_tools as tools

@@ -417,6 +417,22 @@ async def _interrupt_tmux_command(
     if pane_pid is None:
         return
 
+    # Revalidate prior jobs after C-c: an old PID may have exited/reused, while
+    # a still-live old job may have forked. Expand only verified old roots before
+    # reconciling the pane subtree so neither race causes escape or collateral kill.
+    protected = {
+        pid for pid, identity in protected_identities.items()
+        if (identity is not None and _posix_process_identity(pid) == identity)
+        or (identity is None and not _pid_is_confirmed_absent(pid))
+    }
+    for pid in tuple(protected):
+        for descendant in _posix_descendant_pids(pid):
+            if not _pid_is_confirmed_absent(descendant):
+                protected.add(descendant)
+    descendants = [
+        pid for pid in _posix_descendant_pids(pane_pid) if pid not in protected
+    ]
+
     try:
         pane_group = os.getpgid(pane_pid)
     except OSError:
