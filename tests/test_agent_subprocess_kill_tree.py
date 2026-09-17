@@ -367,6 +367,32 @@ def test_posix_parent_map_closes_proc_stat_files(monkeypatch):
 
 
 @pytest.mark.skipif(not sys.platform.startswith("linux"), reason="procfs behavior")
+def test_linux_child_pids_reads_children_from_every_thread(monkeypatch):
+    import io
+
+    from src.agent_tools.subprocess_tools import _linux_child_pids
+
+    class Entry:
+        def __init__(self, name):
+            self.name = name
+
+    monkeypatch.setattr(
+        "src.agent_tools.subprocess_tools.os.scandir",
+        lambda path: [Entry("100"), Entry("101"), Entry("metadata")],
+    )
+
+    def fake_open(path, **kwargs):
+        if "/task/100/children" in path:
+            return io.StringIO("200")
+        if "/task/101/children" in path:
+            return io.StringIO("201 200")
+        raise OSError(path)
+
+    monkeypatch.setattr("builtins.open", fake_open)
+
+    assert _linux_child_pids(100) == [200, 201]
+
+
 def test_linux_child_pids_closes_proc_children_file(monkeypatch):
     import io
 

@@ -63,20 +63,37 @@ def _posix_parent_map() -> dict[int, list[int]]:
 
 
 def _linux_child_pids(parent_pid: int) -> list[int]:
-    """Read direct children without scanning the system-wide process table."""
+    """Read children created by every thread without a system-wide scan."""
+    children: list[int] = []
+    seen: set[int] = set()
     try:
-        with open(
-            f"/proc/{parent_pid}/task/{parent_pid}/children", encoding="utf-8"
-        ) as children_file:
-            value = children_file.read()
+        task_entries = os.scandir(f"/proc/{parent_pid}/task")
     except OSError:
-        return []
-    children = []
-    for item in value.split():
-        try:
-            children.append(int(item))
-        except ValueError:
-            pass
+        return children
+    try:
+        for entry in task_entries:
+            if not entry.name.isdigit():
+                continue
+            try:
+                with open(
+                    f"/proc/{parent_pid}/task/{entry.name}/children",
+                    encoding="utf-8",
+                ) as children_file:
+                    value = children_file.read()
+            except OSError:
+                continue
+            for item in value.split():
+                try:
+                    child_pid = int(item)
+                except ValueError:
+                    continue
+                if child_pid not in seen:
+                    seen.add(child_pid)
+                    children.append(child_pid)
+    finally:
+        close = getattr(task_entries, "close", None)
+        if close is not None:
+            close()
     return children
 
 
