@@ -514,6 +514,40 @@ def test_timeout_kills_tmux_backgrounded_command(tmp_path):
 
 @pytest.mark.skipif(sys.platform == "win32", reason="tmux is POSIX-only")
 @pytest.mark.skipif(shutil.which("tmux") is None, reason="tmux unavailable")
+def test_timeout_recovers_tmux_after_command_exec_replaces_shell(tmp_path):
+    async def run():
+        session_id = f"exec-replaces-shell-{os.getpid()}"
+        name = f"ody-agent-{session_id}"
+        workdir = tmp_path / "changed-cwd"
+        workdir.mkdir()
+        marker = workdir / "recovered"
+        try:
+            _, _, rc, timed_out = await _run_tmux_bash(
+                f"cd {workdir}",
+                session_id=session_id, cwd=str(tmp_path), env=None, timeout=3,
+            )
+            assert (rc, timed_out) == (0, False)
+
+            _, _, rc, timed_out = await _run_tmux_bash(
+                "exec python3 -c 'import signal,time; signal.signal(signal.SIGINT, signal.SIG_IGN); time.sleep(30)'",
+                session_id=session_id, cwd=str(tmp_path), env=None, timeout=0.5,
+            )
+            assert (rc, timed_out) == (124, True)
+
+            _, _, rc, timed_out = await _run_tmux_bash(
+                "touch recovered",
+                session_id=session_id, cwd=str(tmp_path), env=None, timeout=3,
+            )
+            assert (rc, timed_out) == (0, False)
+            assert marker.exists()
+        finally:
+            await _run_exec("tmux", "kill-session", "-t", name, timeout=3)
+
+    asyncio.run(run())
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="tmux is POSIX-only")
+@pytest.mark.skipif(shutil.which("tmux") is None, reason="tmux unavailable")
 def test_cancel_preserves_preexisting_tmux_background_job(tmp_path):
     async def _run():
         survivor = str(tmp_path / "survivor.alive")

@@ -407,14 +407,22 @@ async def _interrupt_tmux_command(
 ) -> None:
     """Interrupt the active command without killing older persistent session jobs."""
     pane_pid = None
+    pane_target = name
+    pane_cwd = None
     out, _, rc = await _run_exec(
-        "tmux", "display-message", "-p", "-t", name, "#{pane_pid}", timeout=3
+        "tmux", "display-message", "-p", "-t", name,
+        "#{pane_pid}\t#{pane_id}\t#{pane_current_path}", timeout=3,
     )
     if rc == 0:
+        fields = out.rstrip("\n").split("\t", 2)
         try:
-            pane_pid = int(out.strip())
+            pane_pid = int(fields[0])
         except ValueError:
             pass
+        if len(fields) > 1 and fields[1].startswith("%"):
+            pane_target = fields[1]
+        if len(fields) > 2 and fields[2]:
+            pane_cwd = fields[2]
 
     descendants = _posix_descendant_pids(pane_pid) if pane_pid else []
     protected_identities = dict(protected_descendants or {})
@@ -430,7 +438,7 @@ async def _interrupt_tmux_command(
             if not _pid_is_confirmed_absent(descendant):
                 protected.add(descendant)
     descendants = [pid for pid in descendants if pid not in protected]
-    await _run_exec("tmux", "send-keys", "-t", name, "C-c", timeout=3)
+    await _run_exec("tmux", "send-keys", "-t", pane_target, "C-c", timeout=3)
     if pane_pid is None:
         return
 
@@ -480,12 +488,21 @@ async def _interrupt_tmux_command(
             pass
 
     ready_marker = f"__ODYSSEUS_INTERRUPT_READY_{time.time_ns()}__"
-    await _tmux_send_line(name, f"printf '{ready_marker}\\n'")
+    await _tmux_send_line(pane_target, f"printf '{ready_marker}\\n'")
     deadline = time.monotonic() + 2
     while time.monotonic() < deadline:
-        if ready_marker in await _tmux_capture(name):
+        if ready_marker in await _tmux_capture(pane_target):
             return
         await asyncio.sleep(0.05)
+
+    # ``exec`` can replace the pane shell with the user command. In that case
+    # C-c and descendant cleanup cannot restore a prompt because the active
+    # process is the pane root itself. Respawn the pane's original command so a
+    # timed-out command cannot permanently wedge the persistent session.
+    respawn_args = ["tmux", "respawn-pane", "-k", "-t", pane_target]
+    if pane_cwd is not None:
+        respawn_args.extend(("-c", pane_cwd))
+    await _run_exec(*respawn_args, timeout=5)
 
 
 async def _ensure_tmux_session(name: str, cwd: str, env: Optional[dict]) -> None:
