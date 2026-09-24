@@ -941,3 +941,122 @@ def test_interrupt_tmux_preserves_portable_live_protected_pid(monkeypatch):
     asyncio.run(tools._interrupt_tmux_command("s", {200: None}))
 
     assert killed == []
+
+
+def test_interrupt_tmux_retains_reparented_pre_interrupt_descendant(monkeypatch):
+    """A command child observed before C-c must not escape by reparenting."""
+    from src.agent_tools import subprocess_tools as tools
+
+    interrupted = False
+
+    async def run_exec(*args, **kwargs):
+        nonlocal interrupted
+        if args[:2] == ("tmux", "display-message"):
+            return "100\n", "", 0
+        if "C-c" in args:
+            interrupted = True
+        return "", "", 0
+
+    async def noop(*args, **kwargs):
+        return None
+
+    async def capture(*args, **kwargs):
+        return "__ODYSSEUS_INTERRUPT_READY_"
+
+    monkeypatch.setattr(tools, "_run_exec", run_exec)
+    monkeypatch.setattr(tools, "_tmux_send_line", noop)
+    monkeypatch.setattr(tools, "_tmux_capture", capture)
+    monkeypatch.setattr(
+        tools,
+        "_posix_descendant_pids",
+        lambda pid: [200] if pid == 100 and not interrupted else [],
+    )
+    monkeypatch.setattr(
+        tools,
+        "_posix_process_identity",
+        lambda pid: ((200 if not interrupted else 300), 201)
+        if pid == 200 else (pid, pid + 1),
+    )
+    monkeypatch.setattr(
+        tools.os, "getpgid", lambda pid: 300 if pid == 200 and interrupted else pid
+    )
+    killed_pids = []
+    killed_groups = []
+    monkeypatch.setattr(tools.os, "kill", lambda pid, sig: killed_pids.append(pid))
+    monkeypatch.setattr(
+        tools.os, "killpg", lambda pgid, sig: killed_groups.append(pgid)
+    )
+
+    asyncio.run(tools._interrupt_tmux_command("s"))
+
+    assert killed_pids == [200]
+    assert killed_groups == [300]
+
+
+def test_interrupt_tmux_retains_reparented_protected_child(monkeypatch):
+    """A prior job child observed before C-c must remain protected if reparented."""
+    from src.agent_tools import subprocess_tools as tools
+
+    interrupted = False
+
+    async def run_exec(*args, **kwargs):
+        nonlocal interrupted
+        if args[:2] == ("tmux", "display-message"):
+            return "100\n", "", 0
+        if "C-c" in args:
+            interrupted = True
+        return "", "", 0
+
+    async def noop(*args, **kwargs): return None
+    async def capture(*args, **kwargs): return "__ODYSSEUS_INTERRUPT_READY_"
+
+    def descendants(pid):
+        if pid == 100 and not interrupted:
+            return [200, 201]
+        if pid == 200 and not interrupted:
+            return [201]
+        return []
+
+    monkeypatch.setattr(tools, "_run_exec", run_exec)
+    monkeypatch.setattr(tools, "_tmux_send_line", noop)
+    monkeypatch.setattr(tools, "_tmux_capture", capture)
+    monkeypatch.setattr(tools, "_posix_descendant_pids", descendants)
+    monkeypatch.setattr(
+        tools, "_posix_process_identity", lambda pid: (pid, pid + 1)
+    )
+    monkeypatch.setattr(tools, "_pid_is_confirmed_absent", lambda pid: False)
+    monkeypatch.setattr(tools.os, "getpgid", lambda pid: pid)
+    killed = []
+    monkeypatch.setattr(tools.os, "kill", lambda pid, sig: killed.append(pid))
+    monkeypatch.setattr(tools.os, "killpg", lambda pgid, sig: killed.append(pgid))
+
+    asyncio.run(tools._interrupt_tmux_command("s", {200: (200, 201)}))
+
+    assert killed == []
+
+
+def test_kill_proc_tree_avoids_stale_pid_on_portable_posix(monkeypatch):
+    """Without a start identity, an exited process PID is unsafe to signal."""
+    from types import SimpleNamespace
+    from src.agent_tools import subprocess_tools as tools
+
+    proc = SimpleNamespace(
+        pid=4100,
+        returncode=0,
+        _odysseus_pgid=4100,
+        _odysseus_identity=None,
+        kill=lambda: (_ for _ in ()).throw(AssertionError("stale pid killed")),
+    )
+    monkeypatch.setattr(tools, "IS_WINDOWS", False)
+    monkeypatch.setattr(tools.sys, "platform", "darwin")
+    monkeypatch.setattr(
+        tools, "_posix_descendant_pids",
+        lambda _pid: (_ for _ in ()).throw(AssertionError("stale tree scanned")),
+    )
+    signalled = []
+    monkeypatch.setattr(tools.os, "killpg", lambda pgid, sig: signalled.append(pgid))
+    monkeypatch.setattr(tools.os, "kill", lambda pid, sig: signalled.append(pid))
+
+    tools._kill_proc_tree(proc)
+
+    assert signalled == []

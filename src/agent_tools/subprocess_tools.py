@@ -160,6 +160,12 @@ def _kill_proc_tree(proc: asyncio.subprocess.Process) -> None:
         kill_process_tree(pid)
         return
 
+    # On platforms without a stable process start identity, a completed
+    # Process handle may refer to a PID that the OS has already reused. Do not
+    # inspect or signal that numeric PID; cleanup while it is live remains safe.
+    if getattr(proc, "returncode", None) is not None and not sys.platform.startswith("linux"):
+        return
+
     descendants = _posix_descendant_pids(pid)
     own_group = os.getpgrp()
     root_group = getattr(proc, "_odysseus_pgid", None)
@@ -425,6 +431,13 @@ async def _interrupt_tmux_command(
             pane_cwd = fields[2]
 
     descendants = _posix_descendant_pids(pane_pid) if pane_pid else []
+    # Preserve identities for command descendants observed before C-c. An INT
+    # handler can daemonize/reparent one before the post-interrupt tree scan.
+    command_identities = {
+        pid: identity[1]
+        for pid in descendants
+        if (identity := _posix_process_identity(pid)) is not None
+    }
     protected_identities = dict(protected_descendants or {})
     protected = {
         pid for pid, identity in protected_identities.items()
@@ -437,6 +450,9 @@ async def _interrupt_tmux_command(
         for descendant in _posix_descendant_pids(pid):
             if not _pid_is_confirmed_absent(descendant):
                 protected.add(descendant)
+                identity = _posix_process_identity(descendant)
+                if identity is not None:
+                    protected_identities[descendant] = identity
     descendants = [pid for pid in descendants if pid not in protected]
     await _run_exec("tmux", "send-keys", "-t", pane_target, "C-c", timeout=3)
     if pane_pid is None:
@@ -454,9 +470,17 @@ async def _interrupt_tmux_command(
         for descendant in _posix_descendant_pids(pid):
             if not _pid_is_confirmed_absent(descendant):
                 protected.add(descendant)
-    descendants = [
-        pid for pid in _posix_descendant_pids(pane_pid) if pid not in protected
-    ]
+    post_interrupt_descendants = _posix_descendant_pids(pane_pid)
+    retained_descendants = {
+        pid
+        for pid, start_identity in command_identities.items()
+        if (live_identity := _posix_process_identity(pid)) is not None
+        and live_identity[1] == start_identity
+    }
+    descendants = list(dict.fromkeys(
+        pid for pid in (*post_interrupt_descendants, *retained_descendants)
+        if pid not in protected
+    ))
 
     try:
         pane_group = os.getpgid(pane_pid)
