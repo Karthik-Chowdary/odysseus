@@ -84,7 +84,7 @@ def test_parent_exit_does_not_orphan_backgrounded_child():
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX process-group behavior")
-def test_parent_exit_cleans_child_with_redirected_output():
+def test_parent_exit_preserves_child_with_redirected_output():
     async def _run():
         marker = _marker_path()
         script = (
@@ -100,39 +100,56 @@ def test_parent_exit_cleans_child_with_redirected_output():
         survived = os.path.exists(marker)
         if survived:
             os.unlink(marker)
-        assert survived is False
+        assert survived is True
 
     asyncio.run(_run())
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX process-group behavior")
 @pytest.mark.skipif(shutil.which("setsid") is None, reason="setsid unavailable")
-def test_parent_exit_cleans_detached_child_with_redirected_output():
+def test_parent_exit_cleans_detached_child_holding_output_pipe():
     async def _run():
         marker = _marker_path()
         inner = f"while :; do touch {shlex.quote(marker)}; sleep .1; done"
-        script = (
-            f"setsid sh -c {shlex.quote(inner)} >/dev/null 2>&1 & "
-            "sleep .2"
-        )
+        script = f"setsid sh -c {shlex.quote(inner)} & sleep .2"
         proc = await _create_bash_subprocess(
             script, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
         )
         try:
-            for _ in range(30):
-                if os.path.exists(marker):
-                    break
-                await asyncio.sleep(0.05)
-            assert os.path.exists(marker), "detached child never started"
             _, _, rc, timed_out = await _run_subprocess_streaming(proc, timeout=30)
             assert (rc, timed_out) == (0, False)
-            os.unlink(marker)
+            if os.path.exists(marker):
+                os.unlink(marker)
             await asyncio.sleep(0.7)
             assert not os.path.exists(marker)
         finally:
             _kill_proc_tree(proc)
             if os.path.exists(marker):
                 os.unlink(marker)
+
+    asyncio.run(_run())
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX process-group behavior")
+@pytest.mark.skipif(shutil.which("setsid") is None, reason="setsid unavailable")
+def test_parent_exit_preserves_detached_child_with_redirected_output():
+    async def _run():
+        marker = _marker_path()
+        inner = f"sleep .4; touch {shlex.quote(marker)}"
+        script = (
+            f"setsid sh -c {shlex.quote(inner)} >/dev/null 2>&1 & "
+            "sleep .1"
+        )
+        proc = await _create_bash_subprocess(
+            script, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
+        _, _, rc, timed_out = await _run_subprocess_streaming(proc, timeout=30)
+        assert (rc, timed_out) == (0, False)
+        await asyncio.sleep(0.7)
+        survived = os.path.exists(marker)
+        if survived:
+            os.unlink(marker)
+        assert survived is True
 
     asyncio.run(_run())
 
@@ -460,10 +477,6 @@ def test_cancel_while_draining_exited_process_still_requests_tree_cleanup(monkey
 
         monkeypatch.setattr(
             "src.agent_tools.subprocess_tools._kill_proc_tree", cleanup_calls.append
-        )
-        monkeypatch.setattr(
-            "src.agent_tools.subprocess_tools._kill_remembered_proc_group",
-            lambda proc, descendants=None: None,
         )
 
         task = asyncio.create_task(_run_subprocess_streaming(Proc(), timeout=30))

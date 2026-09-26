@@ -743,19 +743,20 @@ async def _run_subprocess_streaming(
             if time.monotonic() >= deadline:
                 raise asyncio.TimeoutError
             await asyncio.sleep(min(0.05, max(0, deadline - time.monotonic())))
-        # A successful shell may leave descendants behind even when they detach
-        # into a new session and redirect inherited output. Retain snapshots while
-        # the parent is alive so cleanup does not depend on an exited root PID.
-        _kill_remembered_proc_group(proc, observed_descendants)
+        # Successful commands may intentionally launch detached services. Do not
+        # terminate descendants merely because the direct shell exited; cleanup
+        # remains limited to cancellation, timeout, or a stuck inherited pipe.
     except asyncio.TimeoutError:
         timed_out = True
         _kill_proc_tree(proc)
+        _kill_remembered_proc_group(proc, observed_descendants)
         try:
             await asyncio.wait_for(proc.wait(), timeout=2)
         except Exception:
             pass
     except asyncio.CancelledError:
         _kill_proc_tree(proc)
+        _kill_remembered_proc_group(proc, observed_descendants)
         try:
             await asyncio.wait_for(proc.wait(), timeout=2)
         except Exception:
@@ -781,6 +782,7 @@ async def _run_subprocess_streaming(
             # Cancellation can arrive while draining these readers, after the
             # main cancellation handler is no longer active.
             _kill_proc_tree(proc)
+            _kill_remembered_proc_group(proc, observed_descendants)
             for t in (rd_out, rd_err):
                 t.cancel()
             await readers
