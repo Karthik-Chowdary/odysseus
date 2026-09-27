@@ -228,8 +228,12 @@ def _kill_remembered_proc_group(
     root_group = getattr(proc, "_odysseus_pgid", None)
     verified: list[tuple[int, int]] = []
     for pid, identity in (descendants or {}).items():
-        if _posix_process_identity(pid) == identity:
-            verified.append((pid, identity[0]))
+        live_identity = _posix_process_identity(pid)
+        # The process-group component can legitimately change when a retained
+        # child reparents or calls setsid. Its Linux start time is the stable
+        # identity; after validating that, signal the child's current group.
+        if live_identity is not None and live_identity[1] == identity[1]:
+            verified.append((pid, live_identity[0]))
     groups = {group for _, group in verified if group != own_group}
     # A reused PGID requires a live process whose PID equals that PGID. The
     # original leader identity, or absence of such a PID, proves this is still

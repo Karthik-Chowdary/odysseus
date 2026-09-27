@@ -62,7 +62,10 @@ def test_cancel_kills_backgrounded_grandchild():
     assert asyncio.run(_cancel_and_check(script, marker)) is False
 
 
-@pytest.mark.skipif(sys.platform == "win32", reason="POSIX process-group behavior")
+@pytest.mark.skipif(
+    not sys.platform.startswith("linux"),
+    reason="retained cleanup requires Linux process start identities",
+)
 def test_parent_exit_does_not_orphan_backgrounded_child():
     async def _run():
         marker = _marker_path()
@@ -105,7 +108,10 @@ def test_parent_exit_preserves_child_with_redirected_output():
     asyncio.run(_run())
 
 
-@pytest.mark.skipif(sys.platform == "win32", reason="POSIX process-group behavior")
+@pytest.mark.skipif(
+    not sys.platform.startswith("linux"),
+    reason="retained cleanup requires Linux process start identities",
+)
 @pytest.mark.skipif(shutil.which("setsid") is None, reason="setsid unavailable")
 def test_parent_exit_cleans_detached_child_holding_output_pipe():
     async def _run():
@@ -183,6 +189,54 @@ def test_timeout_kills_backgrounded_grandchild():
         return timed_out, survived
 
     assert asyncio.run(_run()) == (True, False)
+
+
+def test_remembered_descendant_uses_current_group_after_reparenting(monkeypatch):
+    """A retained child keeps its start identity even when its process group changes."""
+    from types import SimpleNamespace
+    from src.agent_tools import subprocess_tools as tools
+
+    proc = SimpleNamespace(
+        pid=4100, returncode=0, _odysseus_pgid=4100,
+        _odysseus_identity=(4100, 11),
+    )
+    monkeypatch.setattr(tools, "IS_WINDOWS", False)
+    monkeypatch.setattr(tools.os, "getpgrp", lambda: 999)
+    monkeypatch.setattr(
+        tools, "_posix_process_identity",
+        lambda pid: {4100: None, 4200: (4300, 22)}.get(pid),
+    )
+    monkeypatch.setattr(tools, "_pid_is_confirmed_absent", lambda pid: pid == 4100)
+    killed_groups = []
+    killed_pids = []
+    monkeypatch.setattr(tools.os, "killpg", lambda pgid, sig: killed_groups.append(pgid))
+    monkeypatch.setattr(tools.os, "kill", lambda pid, sig: killed_pids.append(pid))
+
+    tools._kill_remembered_proc_group(proc, {4200: (4200, 22)})
+
+    assert 4300 in killed_groups
+    assert 4200 not in killed_groups
+    assert 4200 in killed_pids
+
+
+def test_remembered_descendant_rejects_reused_pid(monkeypatch):
+    """A changed Linux start time must prevent signals to a reused PID."""
+    from types import SimpleNamespace
+    from src.agent_tools import subprocess_tools as tools
+
+    proc = SimpleNamespace(
+        pid=4100, returncode=0, _odysseus_pgid=None, _odysseus_identity=None,
+    )
+    monkeypatch.setattr(tools, "IS_WINDOWS", False)
+    monkeypatch.setattr(tools.os, "getpgrp", lambda: 999)
+    monkeypatch.setattr(tools, "_posix_process_identity", lambda pid: (4300, 23))
+    killed = []
+    monkeypatch.setattr(tools.os, "killpg", lambda pgid, sig: killed.append(("group", pgid)))
+    monkeypatch.setattr(tools.os, "kill", lambda pid, sig: killed.append(("pid", pid)))
+
+    tools._kill_remembered_proc_group(proc, {4200: (4200, 22)})
+
+    assert killed == []
 
 
 def test_kill_proc_tree_tolerates_missing_pid():
