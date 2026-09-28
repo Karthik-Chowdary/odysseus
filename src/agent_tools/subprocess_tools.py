@@ -8,6 +8,7 @@ import sys
 import time
 import collections
 import hashlib
+from contextlib import asynccontextmanager
 from typing import Optional, Callable, Awaitable, Tuple, Dict
 from core.platform_compat import IS_WINDOWS, find_bash, kill_process_tree
 from src.constants import MAX_OUTPUT_CHARS
@@ -18,7 +19,24 @@ DEFAULT_PYTHON_TIMEOUT = 60 * 60
 PROGRESS_INTERVAL_S = 2.0
 PROGRESS_TAIL_LINES = 12
 TMUX_CAPTURE_LINES = 2000
-_TMUX_SESSION_LOCKS: dict[str, asyncio.Lock] = {}
+_TMUX_SESSION_LOCKS: dict[str, tuple[asyncio.Lock, int]] = {}
+
+
+@asynccontextmanager
+async def _tmux_session_lock(name: str):
+    """Serialize one session without retaining locks after the last caller."""
+    lock, users = _TMUX_SESSION_LOCKS.get(name, (asyncio.Lock(), 0))
+    _TMUX_SESSION_LOCKS[name] = (lock, users + 1)
+    try:
+        async with lock:
+            yield
+    finally:
+        current = _TMUX_SESSION_LOCKS.get(name)
+        if current is not None and current[0] is lock:
+            if current[1] == 1:
+                del _TMUX_SESSION_LOCKS[name]
+            else:
+                _TMUX_SESSION_LOCKS[name] = (lock, current[1] - 1)
 
 
 def _posix_parent_map() -> dict[int, list[int]]:
@@ -590,8 +608,7 @@ async def _run_tmux_bash(
     progress_cb: Optional[Callable[[Dict], Awaitable[None]]] = None,
 ) -> Tuple[str, str, Optional[int], bool]:
     name = _tmux_session_name(session_id)
-    lock = _TMUX_SESSION_LOCKS.setdefault(name, asyncio.Lock())
-    async with lock:
+    async with _tmux_session_lock(name):
         body = ""
         protected_descendants: dict[int, tuple[int, int] | None] = {}
         command_started = False

@@ -9,6 +9,8 @@ import tempfile
 
 import pytest
 
+import src.agent_tools.subprocess_tools as subprocess_tools
+
 from src.agent_tools.subprocess_tools import (
     _create_bash_subprocess,
     _kill_proc_tree,
@@ -1127,3 +1129,46 @@ def test_kill_proc_tree_avoids_stale_pid_on_portable_posix(monkeypatch):
     tools._kill_proc_tree(proc)
 
     assert signalled == []
+
+
+def test_tmux_session_locks_are_released_after_unique_sessions(monkeypatch, tmp_path):
+    async def run():
+        monkeypatch.setattr(subprocess_tools, "_tmux_has_session", lambda name: asyncio.sleep(0, result=False))
+        monkeypatch.setattr(
+            subprocess_tools,
+            "_run_exec",
+            lambda *args, **kwargs: asyncio.sleep(0, result=("", "", 1)),
+        )
+        monkeypatch.setattr(
+            subprocess_tools, "_ensure_tmux_session", lambda *args, **kwargs: asyncio.sleep(0)
+        )
+        monkeypatch.setattr(
+            subprocess_tools, "_tmux_send_line", lambda *args, **kwargs: asyncio.sleep(0)
+        )
+        monkeypatch.setattr(
+            subprocess_tools,
+            "_tmux_capture",
+            lambda name: asyncio.sleep(
+                0,
+                result=(
+                    f"__ODYSSEUS_CMD_START_0-{abs(hash('true')) % 1000000}__\n"
+                    f"__ODYSSEUS_CMD_END_0-{abs(hash('true')) % 1000000}__:0"
+                ),
+            ),
+        )
+        monkeypatch.setattr(subprocess_tools.time, "time", lambda: 0)
+        subprocess_tools._TMUX_SESSION_LOCKS.clear()
+
+        for index in range(250):
+            result = await subprocess_tools._run_tmux_bash(
+                "true",
+                session_id=f"unique-{index}",
+                cwd=str(tmp_path),
+                env=None,
+                timeout=1,
+            )
+            assert result[2:] == (0, False)
+
+        assert subprocess_tools._TMUX_SESSION_LOCKS == {}
+
+    asyncio.run(run())
